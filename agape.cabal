@@ -1,0 +1,39 @@
+cabal-version:  2.4
+name:           agape
+version:        0.1.0.0
+synopsis:       A Cardano crowd funding dapp that pays out when certain conditions are met
+description:    An example would be:
+author:         Sean Soh
+maintainer:     domy2018@protonmail.com
+build-type:     Simple
+license:        Apache-2.0
+license-file:   LICENSE
+copyright:      © 2022 Sean Soh
+
+extra-source-files:
+    README.md
+    LICENSE
+
+library
+    hs-source-dirs:     src
+    exposed-modules:    Agape
+
+    build-depends:      aeson
+                      , base ^>=4.14.1.0
+                      , containers
+                      , playground-common
+                      , plutus-contract
+                      , plutus-ledger
+                      , plutus-ledger-constraints
+                      , plutus-tx-plugin
+                      , plutus-tx
+                      , text
+                      , freer-extras
+                      , plutus-ledger-api
+                      , data-default
+    default-language:   Haskell2010
+    ghc-options:        -Wall -fobject-code -fno-ignore-interface-pragmas -fno-omit-interface-pragmas -fno-strictness -fno-spec-constr -fno-specialise
+
+
+
+
