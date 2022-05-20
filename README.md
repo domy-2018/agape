@@ -16,12 +16,13 @@ There is also a role of an appointed Arbiter who will settle disputes.
 
 Disputes occur if any of the participants are not satisfied with the outcome. An objection will be successful if a simple majority based on Ada amount is reached. If the objection is successful, then the arbiter steps in and decides on the outcome.
 
-![Overview](./overview.png)
+![Overview](./img/overview.png)
 
-![Succes](./success.png)
+![Succes](./img/success.png)
 
-![Failed](./failed.png)
+![Failed](./img/failed.png)
 
-![Successful objection](./successfulobject.png)
+![Successful objection](./img/successfulobject.png)
+
 
 
