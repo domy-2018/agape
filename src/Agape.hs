@@ -89,14 +89,119 @@ data AgapeAction = Payout | Refund | Object
 PlutusTx.unstableMakeIsData ''AgapeAction
 
 
+-- validator is to validate consuming script Address UTXO, so only three Redeemer actions possible
+-- Payout Refund Object
+--
+-- TODO: Note that for multiple contributions, need to update the same UTXO, that it contributed before,
+--       this is to ensure that for every contributor, there is only one Datum. It gets complicated for refund purposes
+--       if there are multiple UTXOs with the same contributor PPKH
 {-# INLINABLE mkValidatorAgape #-}
 mkValidatorAgape :: Campaign -> AgapeDatum -> AgapeAction -> ScriptContext -> Bool
-mkValidatorAgape c ad ac ctx = True
+mkValidatorAgape Campaign{..} agapeDatum redeemerAction ctx =
+    case redeemerAction of
+        -- objection validation rules:
+        -- > after deadline and before objection deadline
+        -- > signed by the same ppkh of contributor in Datum
+        -- > the sum of continuing output is equal of the input for this contributor
+        -- > continuing output has datum value of Objection is true
+        Object -> traceIfFalse "outside of objection deadline" correctObjectionDeadline         &&
+                  traceIfFalse "signed by contributor" correctObjectionSignature                &&
+                  traceIfFalse "continuing output sum paid to script" correctObjectionValue     &&
+                  traceIfFalse "continuing output datum Objection is set" correctObjectionDatum
 
+        -- refund validation rules:
+        -- > after objection deadline
+        -- > no evidence provided
+        -- > Refunding the correct amount back to the contributor
+        -- > TODO: if successful objection, only arbiter can refund. If no successful objection, anyone can refund
+        Refund -> traceIfFalse "have not passed objection deadline" correctRefundDeadline &&
+                  traceIfFalse "evidence was provided" noEvidenceProvided                 &&
+                  traceIfFalse "amount refunded incorrect" correctRefundAmount
+
+        -- payout validation rules:
+        -- >
+        Payout -> True
   where
     info :: TxInfo
     info = scriptContextTxInfo ctx
 
+    ownValidatorHash :: ValidatorHash
+    ownValidatorHash = ownHash ctx
+
+    ownScriptAddress :: Address
+    ownScriptAddress = scriptHashAddress ownValidatorHash
+
+    ownInput :: Maybe TxInInfo
+    ownInput = findOwnInput ctx
+
+    ownInputs :: [TxOut]
+    ownInputs = filter (\txout -> ownScriptAddress == txOutAddress txout) (fmap txInInfoResolved $ txInfoInputs info)
+
+    -- Objection validations
+    -- *********************
+    correctObjectionDeadline :: Bool
+    correctObjectionDeadline = interval cDeadline cDeadlineObject `contains` txInfoValidRange info
+
+    correctObjectionSignature :: Bool
+    correctObjectionSignature = txSignedBy info (unPaymentPubKeyHash $ adContributor agapeDatum)
+
+    ownOutput      :: TxOut
+    ownOutputDatum :: AgapeDatum
+    (ownOutput, ownOutputDatum) = case getContinuingOutputs ctx of
+        [o] -> case txOutDatumHash o of
+            Nothing -> traceError "wrong output type"
+            Just dh -> case findDatum dh info of
+                Nothing        -> traceError "datum not found"
+                Just (Datum d) -> case PlutusTx.fromBuiltinData d of
+                    Just ad -> (o, ad)
+                    Nothing -> traceError "error decoding datum"
+        _   -> traceError "only one continuing output expected"
+   
+    correctObjectionDatum :: Bool
+    correctObjectionDatum = adContributor ownOutputDatum == adContributor agapeDatum &&
+                            adObjects ownOutputDatum
+
+    -- sum of input value == output. Input value has been filtered first to only include all script input only
+    correctObjectionValue :: Bool
+    correctObjectionValue = mconcat (fmap txOutValue ownInputs) == txOutValue ownOutput 
+
+
+    -- Refund validations
+    -- ******************
+    correctRefundDeadline :: Bool
+    correctRefundDeadline = from cDeadlineObject `contains` txInfoValidRange info
+
+    -- check through all input utxos, ensure contributor ppkh is beneficiary, and NO evidence provided
+    noEvidenceProvided :: Bool
+    noEvidenceProvided = not $ any checkEvidence $ mapMaybe PlutusTx.fromBuiltinData $ fmap getDatum $ mapMaybe (`findDatum` info) $ mapMaybe txOutDatumHash ownInputs
+
+    -- this function checks that the evidence exists
+    checkEvidence :: AgapeDatum -> Bool
+    checkEvidence ad = adContributor ad == cBeneficiary && isJust (adEvidence ad)
+
+    -- for the UTXO input that's being validated, check the output to ensure there is a corresponding payment
+    correctRefundAmount :: Bool
+    correctRefundAmount = case ownInput of
+        Nothing -> traceError "no input found for refund to be validated"
+        Just txininfo ->
+            let refundtxout = txInInfoResolved txininfo
+                refundval = txOutValue refundtxout
+                refunddathash = txOutDatumHash refundtxout
+            in
+                case refunddathash of
+                    Nothing -> traceError "datum hash not found for refund"
+                    Just dh -> case findDatum dh info of
+                        Nothing -> traceError "datum not found for refund"
+                        Just (Datum d) -> case PlutusTx.fromBuiltinData d of
+                            Nothing -> traceError "error decoding datum for refund"
+                            Just ad ->
+                                let
+                                    os = [o | o <- txInfoOutputs info, txOutAddress o == pubKeyHashAddress (adContributor ad) Nothing] -- how to handle stake key?
+                                in
+                                    case os of
+                                        [o] -> txOutValue o == refundval -- by only checking for one output means that the contributor cannot call the refund endpoint.
+                                                                         -- because it will create two outputs paid to the same contributor (change + fees)
+                                        _   -> traceError "expected only one refund output per contributor"
 
 data AgapeType
 instance Scripts.ValidatorTypes AgapeType where
@@ -145,7 +250,7 @@ data ProducerParams = ProducerParams
     , ppEvidence            :: !(Maybe BuiltinByteString)
     }
     deriving stock (Generic)
-    deriving anyclass (FromJSON, ToJSON, ToSchema)  
+    deriving anyclass (FromJSON, ToJSON, ToSchema)
 
 -- contribute to the campaign
 contribute :: AsContractError e => ProducerParams -> Contract w s e ()
@@ -199,7 +304,7 @@ objects (ObjectionParams campaign@Campaign{..}) = do
                   Constraints.otherScript (agapeValidator campaign)                             Prelude.<>
                   Constraints.unspentOutputs (Map.fromList [(oref, o) | (oref, o, _) <- utxos])
 
-        tx = Constraints.mustValidateIn (interval (cDeadline + 1) cDeadlineObject)          <>
+        tx = Constraints.mustValidateIn (interval cDeadline cDeadlineObject)                <>
              Constraints.mustPayToTheScript obj_datum totalval                              <>
              mconcat [Constraints.mustSpendScriptOutput outref r | (outref, _, _) <- utxos]
 
@@ -408,6 +513,7 @@ trace2 :: EmulatorTrace ()
 trace2 = do
     h1 <- activateContractWallet (knownWallet 1) endpoints
     h2 <- activateContractWallet (knownWallet 2) endpoints
+    h3 <- activateContractWallet (knownWallet 3) endpoints
 
     let 
         campaignDesc   = "run a marathon for charity"
@@ -441,7 +547,7 @@ trace2 = do
 
     void $ Trace.waitNSlots 25
 
-    callEndpoint @"refund" h1 refundParams
+    callEndpoint @"refund" h3 refundParams
 
     s <- Trace.waitNSlots 1
 
