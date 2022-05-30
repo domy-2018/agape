@@ -114,13 +114,25 @@ mkValidatorAgape Campaign{..} agapeDatum redeemerAction ctx =
         -- > no evidence provided
         -- > Refunding the correct amount back to the contributor
         -- > TODO: if successful objection, only arbiter can refund. If no successful objection, anyone can refund
-        Refund -> traceIfFalse "have not passed objection deadline" correctRefundDeadline &&
-                  traceIfFalse "evidence was provided" noEvidenceProvided                 &&
-                  traceIfFalse "amount refunded incorrect" correctRefundAmount
+        Refund -> traceIfFalse "refund - have not passed objection deadline" correctPastObjectionDeadline &&
+                  traceIfFalse "refund - evidence was provided" noEvidenceProvided                 &&
+                  traceIfFalse "refund - amount refunded incorrect" correctRefundAmount
 
         -- payout validation rules:
-        -- >
-        Payout -> True
+        -- > after objection deadline
+        -- > evidence provided
+        -- > all amounts go to beneficiary ** PROBLEM 1 ** how do you ensure all the contributed amounts go to beneficiary?
+        --                                                 what if an attacker created a transaction with just one evidence, and small contributed amount
+        --                                                 and then created another transaction to refund the rest? 
+        --                                                 Solution: maybe just ensure that beneficiary needs to sign the payout transaction?
+        --                                 ** PROBLEM 2 ** what if beneficiary in quick succession puts a fake evidence then creates a transaction
+        --                                                 after objection deadline to payout? There's nothing stopping the beneficiary from
+        --                                                 putting some fake evidence after the objection deadline.
+        --                                                 Solution: add a refund window? so gives some time to refund first if no evidence.
+        Payout -> traceIfFalse "payout - have not passed objection deadline" correctPastObjectionDeadline &&
+                  traceIfFalse "payout - evidence not provided" evidenceProvided                          &&
+                  traceIfFalse "payout - not signed by beneficiary" payoutSignedByBeneficiary             &&
+                  traceIfFalse "payout - amount paid to beneficiary incorrect" beneficiaryPaidCorrectly
   where
     info :: TxInfo
     info = scriptContextTxInfo ctx
@@ -136,6 +148,9 @@ mkValidatorAgape Campaign{..} agapeDatum redeemerAction ctx =
 
     ownInputs :: [TxOut]
     ownInputs = filter (\txout -> ownScriptAddress == txOutAddress txout) (fmap txInInfoResolved $ txInfoInputs info)
+
+    totalInputValue :: Value
+    totalInputValue = mconcat (fmap txOutValue ownInputs)
 
     -- Objection validations
     -- *********************
@@ -163,17 +178,17 @@ mkValidatorAgape Campaign{..} agapeDatum redeemerAction ctx =
 
     -- sum of input value == output. Input value has been filtered first to only include all script input only
     correctObjectionValue :: Bool
-    correctObjectionValue = mconcat (fmap txOutValue ownInputs) == txOutValue ownOutput 
+    correctObjectionValue = totalInputValue == txOutValue ownOutput
 
 
     -- Refund validations
     -- ******************
-    correctRefundDeadline :: Bool
-    correctRefundDeadline = from cDeadlineObject `contains` txInfoValidRange info
+    correctPastObjectionDeadline :: Bool
+    correctPastObjectionDeadline = from cDeadlineObject `contains` txInfoValidRange info
 
     -- check through all input utxos, ensure contributor ppkh is beneficiary, and NO evidence provided
     noEvidenceProvided :: Bool
-    noEvidenceProvided = not $ any checkEvidence $ mapMaybe PlutusTx.fromBuiltinData $ fmap getDatum $ mapMaybe (`findDatum` info) $ mapMaybe txOutDatumHash ownInputs
+    noEvidenceProvided = not evidenceProvided
 
     -- this function checks that the evidence exists
     checkEvidence :: AgapeDatum -> Bool
@@ -202,6 +217,21 @@ mkValidatorAgape Campaign{..} agapeDatum redeemerAction ctx =
                                         [o] -> txOutValue o == refundval -- by only checking for one output means that the contributor cannot call the refund endpoint.
                                                                          -- because it will create two outputs paid to the same contributor (change + fees)
                                         _   -> traceError "expected only one refund output per contributor"
+
+    -- Payout validations
+    -- ******************
+    evidenceProvided :: Bool
+    evidenceProvided = any checkEvidence $ mapMaybe PlutusTx.fromBuiltinData $ fmap getDatum $ mapMaybe (`findDatum` info) $ mapMaybe txOutDatumHash ownInputs
+
+    payoutSignedByBeneficiary :: Bool
+    payoutSignedByBeneficiary = txSignedBy info (unPaymentPubKeyHash cBeneficiary)
+
+    -- sum up the total value from inputs, and ensure this amount goes to the beneficiary
+    -- Note: I check to ensure that for all the output UTXO, there is a value amount that is equal to the sum of all the input
+    --       I don't just do a simple sum of output >= input, because the change could be greater than the input value locked in contract
+    beneficiaryPaidCorrectly :: Bool
+    beneficiaryPaidCorrectly = any (== totalInputValue) [txOutValue o | o <- txInfoOutputs info, txOutAddress o == pubKeyHashAddress cBeneficiary Nothing] -- stake key?
+    
 
 data AgapeType
 instance Scripts.ValidatorTypes AgapeType where
@@ -560,6 +590,7 @@ trace3 = do
     h1 <- activateContractWallet (knownWallet 1) endpoints
     h2 <- activateContractWallet (knownWallet 2) endpoints
     h3 <- activateContractWallet (knownWallet 3) endpoints
+    h4 <- activateContractWallet (knownWallet 4) endpoints
 
     let 
         campaignDesc   = "run a marathon for charity"
