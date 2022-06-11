@@ -22,6 +22,7 @@ import qualified Ledger.Typed.Scripts as Scripts
 import           Plutus.Contract
 import qualified PlutusTx
 import           PlutusTx.Prelude
+import           Ledger.Value         as Value
 
 import           Control.Monad        (void, when)
 import           Data.Aeson           (ToJSON, FromJSON)
@@ -47,6 +48,15 @@ import Data.Text (Text)
 import qualified Control.Monad.Freer.Extras as Extras
 
 
+import AgapeData
+import AgapeMint
+import AgapeMint (policyAgape, curSymbolAgape)
+import qualified Ledger.Value as Value
+
+
+-- Improvements -> If Arbiter needs to act, then arbiter gets a portion of the funds as compensation
+-- Limitations  -> May not work if too many UTXOs to validate in one transaction, so may need some kind of batching solution
+-- Major ISSUE  -> How to ensure that all objections registered as a UTXO on the script address are counted?
 
 -- ############# --
 -- On-chain code --
@@ -65,6 +75,7 @@ import qualified Control.Monad.Freer.Extras as Extras
 -- > Payout
 -- > Refund
 
+{-
 data Campaign = Campaign
     { cDescription    :: !BuiltinByteString
     , cDeadline       :: !POSIXTime
@@ -87,7 +98,7 @@ PlutusTx.unstableMakeIsData ''AgapeDatum
 data AgapeAction = Payout | Refund | Object
 
 PlutusTx.unstableMakeIsData ''AgapeAction
-
+-}
 
 -- validator is to validate consuming script Address UTXO, so only three Redeemer actions possible
 -- Payout Refund Object
@@ -113,10 +124,11 @@ mkValidatorAgape Campaign{..} agapeDatum redeemerAction ctx =
         -- > after objection deadline
         -- > no evidence provided
         -- > Refunding the correct amount back to the contributor
-        -- > TODO: if successful objection, only arbiter can refund. If no successful objection, anyone can refund
         Refund -> traceIfFalse "refund - have not passed objection deadline" correctPastObjectionDeadline &&
-                  traceIfFalse "refund - evidence was provided" noEvidenceProvided                 &&
-                  traceIfFalse "refund - amount refunded incorrect" correctRefundAmount
+                  traceIfFalse "refund - amount refunded incorrect" correctRefundAmount                   &&
+                  if objectionIsSuccessful
+                  then traceIfFalse "refund - not signed by arbiter" signedByArbiter
+                  else traceIfFalse "refund - evidence was provided" noEvidenceProvided
 
         -- payout validation rules:
         -- > after objection deadline
@@ -130,9 +142,11 @@ mkValidatorAgape Campaign{..} agapeDatum redeemerAction ctx =
         --                                                 putting some fake evidence after the objection deadline.
         --                                                 Solution: add a refund window? so gives some time to refund first if no evidence.
         Payout -> traceIfFalse "payout - have not passed objection deadline" correctPastObjectionDeadline &&
-                  traceIfFalse "payout - evidence not provided" evidenceProvided                          &&
-                  traceIfFalse "payout - not signed by beneficiary" payoutSignedByBeneficiary             &&
-                  traceIfFalse "payout - amount paid to beneficiary incorrect" beneficiaryPaidCorrectly
+                  traceIfFalse "payout - amount paid to beneficiary incorrect" beneficiaryPaidCorrectly   &&
+                  if objectionIsSuccessful
+                  then traceIfFalse "payout - not signed by arbiter" signedByArbiter
+                  else traceIfFalse "payout - evidence not provided" evidenceProvided                     &&
+                       traceIfFalse "payout - not signed by beneficiary" payoutSignedByBeneficiary
   where
     info :: TxInfo
     info = scriptContextTxInfo ctx
@@ -149,8 +163,39 @@ mkValidatorAgape Campaign{..} agapeDatum redeemerAction ctx =
     ownInputs :: [TxOut]
     ownInputs = filter (\txout -> ownScriptAddress == txOutAddress txout) (fmap txInInfoResolved $ txInfoInputs info)
 
+    -- list of script inputs with valid datum
+    ownInputsValidDatum :: [(TxOut, AgapeDatum)]
+    ownInputsValidDatum = fmap getValidDatum ownInputs
+
+    -- function to get a tuple of txout and datum from txout
+    getValidDatum :: TxOut -> (TxOut, AgapeDatum)
+    getValidDatum tout = case txOutDatumHash tout of
+            Nothing -> traceError "wrong output type"
+            Just dh -> case findDatum dh info of
+                Nothing        -> traceError "datum not found"
+                Just (Datum d) -> case PlutusTx.fromBuiltinData d of
+                    Just ad -> (tout, ad)
+                    Nothing -> traceError "error decoding datum"
+
+    -- total input value with valid datum
     totalInputValue :: Value
-    totalInputValue = mconcat (fmap txOutValue ownInputs)
+    totalInputValue = mconcat (fmap (txOutValue . fst) ownInputsValidDatum)
+
+    -- check whether objection is successful or not here
+    -- this is done by checking each UTXO, and summing up the amount which has objection flag set
+    -- For an objection to be successful, the objection amount must be greater than 1/2 of total value
+    --
+    -- ** PROBLEM ** since the validator only checks the inputs to the transaction, and not all the UTXOs sitting at the script address,
+    --               how can we be sure that the objection is really succesful or not? Since I don't have a view of all the UTXOs, only what is
+    --               on this transaction?
+    objectionIsSuccessful :: Bool
+    objectionIsSuccessful = fromValue objectionPower > (fromValue totalInputValue `Ada.divide` lovelaceOf 2)
+      where
+        objectionPower :: Value
+        objectionPower = mconcat [ txOutValue totov | (totov, agd) <- ownInputsValidDatum, adObjects agd ] -- filter objection = True
+
+    signedByArbiter :: Bool
+    signedByArbiter = txSignedBy info (unPaymentPubKeyHash cArbiter)
 
     -- Objection validations
     -- *********************
@@ -163,13 +208,7 @@ mkValidatorAgape Campaign{..} agapeDatum redeemerAction ctx =
     ownOutput      :: TxOut
     ownOutputDatum :: AgapeDatum
     (ownOutput, ownOutputDatum) = case getContinuingOutputs ctx of
-        [o] -> case txOutDatumHash o of
-            Nothing -> traceError "wrong output type"
-            Just dh -> case findDatum dh info of
-                Nothing        -> traceError "datum not found"
-                Just (Datum d) -> case PlutusTx.fromBuiltinData d of
-                    Just ad -> (o, ad)
-                    Nothing -> traceError "error decoding datum"
+        [o] -> getValidDatum o
         _   -> traceError "only one continuing output expected"
    
     correctObjectionDatum :: Bool
@@ -231,7 +270,7 @@ mkValidatorAgape Campaign{..} agapeDatum redeemerAction ctx =
     --       I don't just do a simple sum of output >= input, because the change could be greater than the input value locked in contract
     beneficiaryPaidCorrectly :: Bool
     beneficiaryPaidCorrectly = any (== totalInputValue) [txOutValue o | o <- txInfoOutputs info, txOutAddress o == pubKeyHashAddress cBeneficiary Nothing] -- stake key?
-    
+
 
 data AgapeType
 instance Scripts.ValidatorTypes AgapeType where
@@ -256,6 +295,26 @@ agapeValHash = Scripts.validatorHash . agapeTypedValidator
 
 agapeAddress :: Campaign -> Ledger.Address
 agapeAddress = scriptAddress . agapeValidator
+
+
+
+-- Minting policy for NFT on successful payout
+-- > Only mints for Payout Redeemer action
+-- > Ensure each token name minted can only be 1
+-- > Ensure only happens when payout is successful
+-- > Ensure each conributor got an NFT
+{-
+{-# INLINABLE mkPolicyAgape #-}
+mkPolicyAgape :: Campaign -> AgapeAction -> ScriptContext -> Bool
+mkPolicyAgape _ _ _ = True
+
+policyAgape :: Campaign -> Scripts.MintingPolicy
+policyAgape campaign = mkMintingPolicyScript $
+    $$(PlutusTx.compile [|| Scripts.wrapMintingPolicy . mkPolicyAgape ||])
+    `PlutusTx.applyCode`
+    PlutusTx.liftCode campaign
+-}
+
 
 
 
@@ -345,9 +404,9 @@ objects (ObjectionParams campaign@Campaign{..}) = do
 -- payout
 -- > in order for payout, one of the valid UTXOs must be submitted by the beneficiary with evidence
 -- > must be past the objection deadline
--- > must not have a successful objection (***TODO***)
--- > if objection is successful, then only proceed if signed by arbiter (**TODO**)
--- > Also need to mint NFT for every contributer
+-- > must not have a successful objection
+-- > if objection is successful, then only proceed if signed by arbiter
+-- > Also need to mint NFT for every contributer (**TODO**)
 
 newtype PayoutParams = PayoutParams Campaign
     deriving stock (Generic)
@@ -355,22 +414,32 @@ newtype PayoutParams = PayoutParams Campaign
 
 payout :: PayoutParams -> Contract w s Text ()
 payout (PayoutParams campaign@Campaign{..}) = do
-    utxos <- findUTXOs campaign Nothing -- find all suitable utxos
+    utxos   <- findUTXOs campaign Nothing -- find all suitable utxos
+    now     <- currentTime
+    ownppkh <- ownPaymentPubKeyHash
 
-    -- if cannot find evidence, then fail
-    when (not $ evidenceFound utxos cBeneficiary) $ throwError "Evidence not found"
+    when (now < cDeadlineObject)                       $ throwError "Can only payout past objection deadline"
+
+    if objectionSuccessful utxos
+    then when (ownppkh /= cArbiter)                    $ throwError "You must be an arbiter to process the payout as objections are successful"
+    else when (not $ evidenceFound utxos cBeneficiary) $ throwError "Evidence not found, cannot payout"
 
     let r = Redeemer $ PlutusTx.toBuiltinData Payout
 
         totalval = mconcat [_ciTxOutValue chainidx | (_, chainidx, _) <- utxos]
 
+        nftval = Value.singleton (curSymbolAgape campaign) "TokenName" 1
+
         lookups = Constraints.typedValidatorLookups (agapeTypedValidator campaign)              Prelude.<>
                   Constraints.otherScript (agapeValidator campaign)                             Prelude.<>
-                  Constraints.unspentOutputs (Map.fromList [(oref, o) | (oref, o, _) <- utxos])
+                  Constraints.unspentOutputs (Map.fromList [(oref, o) | (oref, o, _) <- utxos]) Prelude.<>
+                  Constraints.mintingPolicy (policyAgape campaign)
 
-        tx = Constraints.mustValidateIn (from cDeadlineObject) <>
-             Constraints.mustPayToPubKey cBeneficiary totalval <>
-             mconcat [Constraints.mustSpendScriptOutput oref r | (oref, _, _) <- utxos]
+        tx = Constraints.mustValidateIn (from cDeadlineObject)                          <>
+             Constraints.mustPayToPubKey cBeneficiary totalval                          <>
+             mconcat [Constraints.mustSpendScriptOutput oref r | (oref, _, _) <- utxos] <>
+             Constraints.mustMintValue nftval  <>
+             Constraints.mustPayToPubKey ownppkh (nftval <> lovelaceValueOf 2_000_000)
 
     ledgerTx <- submitTxConstraintsWith lookups tx
     void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
@@ -387,13 +456,21 @@ newtype RefundParams = RefundParams Campaign
     deriving anyclass (FromJSON, ToJSON, ToSchema)
 
 -- refund to the contributors
--- **TODO**
 -- > take into account objections, if objections are valid, then only proceed if signed by arbiter if not error.
-refund :: AsContractError e => RefundParams -> Contract w s e ()
+-- > check to ensure evidence was not provided
+refund :: RefundParams -> Contract w s Text ()
 refund (RefundParams campaign@Campaign{..}) = do
     -- get the utxos, filter for the right Datum to get the Contributor, get the Value.
     -- then for each contributor ppkh, create a Constraint and put the value in as payment 
-    utxos <- findUTXOs campaign Nothing
+    utxos   <- findUTXOs campaign Nothing
+    now     <- currentTime
+    ownppkh <- ownPaymentPubKeyHash
+
+    when (now < cDeadlineObject)                 $ throwError "Can only refund past objection deadline"
+
+    if objectionSuccessful utxos
+    then when (ownppkh /= cArbiter)              $ throwError "You must be an arbiter to process the refund as objections are successful"
+    else when (evidenceFound utxos cBeneficiary) $ throwError "Evidence was found, cannot refund"
 
     let r = Redeemer $ PlutusTx.toBuiltinData Refund
    
@@ -411,6 +488,17 @@ refund (RefundParams campaign@Campaign{..}) = do
     ledgerTx <- submitTxConstraintsWith lookups tx
     void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
     logInfo @String $ printf "refunded"
+
+-- ** PROBLEM ** it is possible for an attacker to construct a transaction and not include any objections,
+--               how can we be sure that the objection is really succesful or not?
+objectionSuccessful :: [(TxOutRef, ChainIndexTxOut, AgapeDatum)] -> Bool
+objectionSuccessful utxos = fromValue objectionPower > (fromValue totalUTXOValue `Ada.divide` lovelaceOf 2)
+  where
+    objectionPower :: Value
+    objectionPower = mconcat [ _ciTxOutValue chainidx | (_, chainidx, agd) <- utxos, adObjects agd ] -- filter objection = True
+
+    totalUTXOValue :: Value
+    totalUTXOValue = mconcat [ _ciTxOutValue chainidx | (_, chainidx, _) <- utxos ] -- sum up all the value
 
 
 

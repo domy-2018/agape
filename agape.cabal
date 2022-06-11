@@ -17,6 +17,8 @@ extra-source-files:
 library
     hs-source-dirs:     src
     exposed-modules:    Agape
+                      , AgapeMint
+                      , AgapeData
 
     build-depends:      aeson
                       , base ^>=4.14.1.0
