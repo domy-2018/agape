@@ -7,7 +7,7 @@ Examples could be:
  - Person A to discuss with Person B on a certain topic on a platform such as YouTube. If this condition is satisfied, and YouTube evidence provided, then the crowd sourced amount is donated to charity C.
  - Person A to run a marathon by a certain date. If this condition is satisfied, then contributed amount donated to charity
 
-If the above conditions happen, the accumulated Ada will be paid to Beneficiary C (could be multiple beneficiaries)
+If the above conditions happen, the accumulated Ada will be paid to Beneficiary C
 
 If the above conditions did not happen, then the accumulated Ada will be refunded to all crowd source participants.
 
@@ -15,7 +15,9 @@ Minting of a commemorative NFT token for every participant contributor, where we
 
 There is also a role of an appointed Arbiter who will settle disputes.
 
-Disputes occur if any of the participants are not satisfied with the outcome. An objection will be successful if a simple majority based on Ada amount is reached. If the objection is successful, then the arbiter steps in and decides on the outcome.
+Disputes occur if any of the participants are not satisfied with the outcome. A campaign contributor can register an objection. An objection will be successful if a simple majority based on Ada amount contributed is reached. If the objection is successful, then the arbiter steps in and decides on the outcome.
+
+## Examples of transaction states
 
 ![Overview](./img/overview.png)
 
@@ -24,6 +26,23 @@ Disputes occur if any of the participants are not satisfied with the outcome. An
 ![Failed](./img/failed.png)
 
 ![Successful objection](./img/successfulobject.png)
+
+
+## Current limitations, improvements and issues
+
+### Improvements
+1. If an arbiter needs to act, then there should be some incentive for the arbiter. The arbiter should receive a small percentage of the contributed Ada as compensation. Currently arbiter receives nothing.
+2. If the same contributor wants to conribute multiple times, then the subsequent contributions need to update their existing contribution. This is to ensure that for every contributor, there is only one UTXO and one Datum. It gets complicated for refund purposes if there are multiple UTXOs from the same contributor.
+
+### Limitations
+1. Current limitations of transaction size limit, where we cannot include too many UTXOs in one transaction. To overcome this, may require a batching strategy.
+
+### Major Issue
+1. Objections in the current design is open for attacks. The logic will work for honest actors, but an attacker could very easily create a transaction without all the objections, such that they could engineer a false refund, or a false payout. This is because the script validation, is unable to check all the UTXOs on the script address for objections, but can only check what has been included in the transaction.
+
+### Minor issue
+1. A beneficiary could place a fake evidence and then quickly create another transaction to payout. To circumvent this, we could add a refund window, to allow any potential refunds to occur first before payouts.
+
 
 
 
