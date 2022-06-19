@@ -17,7 +17,7 @@ There is also a role of an appointed Arbiter who will settle disputes.
 
 Disputes occur if any of the participants are not satisfied with the outcome. A campaign contributor can register an objection. An objection will be successful if a simple majority based on Ada amount contributed is reached. If the objection is successful, then the arbiter steps in and decides on the outcome.
 
-## Examples of transaction states
+## Examples of transition states and transactions
 
 ![Overview](./img/overview.png)
 
