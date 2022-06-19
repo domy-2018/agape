@@ -37,7 +37,6 @@ import           Text.Printf          (printf)
 
 import           Playground.Contract  (KnownCurrency (..), ToSchema, ensureKnownCurrencies, mkSchemaDefinitions, printJson, printSchemas, stage)
 import qualified Plutus.Contract as Constraints
-import Plutus.Trace (runEmulatorTraceIO, activateContractWallet)
 
 
 -- imports for EmulatorTrace testing
@@ -45,15 +44,19 @@ import Plutus.V1.Ledger.Ada (lovelaceValueOf)
 import Wallet.Emulator.Wallet
 import Plutus.Trace (EmulatorTrace, activateContractWallet, callEndpoint, runEmulatorTraceIO)
 import qualified Plutus.Trace as Trace
-import Data.Text (Text)
 import qualified Control.Monad.Freer.Extras as Extras
 
 
+-- had to separate out the datum and redeemer object as I was getting an error when the minting policy also 
+-- wanted to use these objects
 import AgapeData
 import AgapeMint
 
 
--- Improvements -> If Arbiter needs to act, then arbiter gets a portion of the funds as compensation
+-- Improvements -> TODO: If Arbiter needs to act, then arbiter gets a portion of the funds as compensation
+--                 TODO: Note that for multiple contributions, need to update the same UTXO, that it contributed before,
+--                       this is to ensure that for every contributor, there is only one Datum. It gets complicated for refund purposes
+--                       if there are multiple UTXOs with the same contributor PPKH
 -- Limitations  -> May not work if too many UTXOs to validate in one transaction, so may need some kind of batching solution
 -- Major ISSUE  -> How to ensure that all objections registered as a UTXO on the script address are counted?
 
@@ -61,50 +64,11 @@ import AgapeMint
 -- On-chain code --
 -- ############# --
 
--- Parameters
--- > Campaign (description, deadline_campaign, deadline_objection, beneficiary, arbiter)
---
--- Datum
--- > contributor PPKH
--- > contributor objects
--- > Evidence
---
--- Redeemer
--- > Object
--- > Payout
--- > Refund
 
-{-
-data Campaign = Campaign
-    { cDescription    :: !BuiltinByteString
-    , cDeadline       :: !POSIXTime
-    , cDeadlineObject :: !POSIXTime
-    , cBeneficiary    :: !PaymentPubKeyHash
-    , cArbiter        :: !PaymentPubKeyHash
-    }
-    deriving (Generic, ToJSON, FromJSON, ToSchema)
-
-PlutusTx.makeLift ''Campaign
-
-data AgapeDatum = AgapeDatum
-    { adContributor :: !PaymentPubKeyHash
-    , adObjects     :: !Bool
-    , adEvidence    :: !(Maybe BuiltinByteString)
-    }
-
-PlutusTx.unstableMakeIsData ''AgapeDatum
-
-data AgapeAction = Payout | Refund | Object
-
-PlutusTx.unstableMakeIsData ''AgapeAction
--}
-
--- validator is to validate consuming script Address UTXO, so only three Redeemer actions possible
--- Payout Refund Object
---
--- TODO: Note that for multiple contributions, need to update the same UTXO, that it contributed before,
---       this is to ensure that for every contributor, there is only one Datum. It gets complicated for refund purposes
---       if there are multiple UTXOs with the same contributor PPKH
+-- validator is to validate consuming script Address UTXO, so only three Redeemer actions possible:
+-- Payout, Refund, Object
+-- The currency symbol passed in, is to ensure that the correct NFT is minted for a Payout
+-- Campaign is passed in as a parameter, so each different Campaign will have a unique script address
 {-# INLINABLE mkValidatorAgape #-}
 mkValidatorAgape :: CurrencySymbol -> Campaign -> AgapeDatum -> AgapeAction -> ScriptContext -> Bool
 mkValidatorAgape cs Campaign{..} agapeDatum redeemerAction ctx =
@@ -140,7 +104,7 @@ mkValidatorAgape cs Campaign{..} agapeDatum redeemerAction ctx =
         -- > all amounts go to beneficiary ** PROBLEM 1 ** how do you ensure all the contributed amounts go to beneficiary?
         --                                                 what if an attacker created a transaction with just one evidence, and small contributed amount
         --                                                 and then created another transaction to refund the rest? 
-        --                                                 Solution: maybe just ensure that beneficiary needs to sign the payout transaction?
+        --                                                 Solution: just ensure that beneficiary needs to sign the payout transaction
         --                                 ** PROBLEM 2 ** what if beneficiary in quick succession puts a fake evidence then creates a transaction
         --                                                 after objection deadline to payout? There's nothing stopping the beneficiary from
         --                                                 putting some fake evidence after the objection deadline.
@@ -330,24 +294,6 @@ agapeAddress cs = scriptAddress . agapeValidator cs
 
 
 
--- Minting policy for NFT on successful payout
--- > Only mints for Payout Redeemer action
--- > Ensure each token name minted can only be 1
--- > Ensure only happens when payout is successful
--- > Ensure each conributor got an NFT
-{-
-{-# INLINABLE mkPolicyAgape #-}
-mkPolicyAgape :: Campaign -> AgapeAction -> ScriptContext -> Bool
-mkPolicyAgape _ _ _ = True
-
-policyAgape :: Campaign -> Scripts.MintingPolicy
-policyAgape campaign = mkMintingPolicyScript $
-    $$(PlutusTx.compile [|| Scripts.wrapMintingPolicy . mkPolicyAgape ||])
-    `PlutusTx.applyCode`
-    PlutusTx.liftCode campaign
--}
-
-
 
 
 -- ############## --
@@ -408,7 +354,7 @@ contribute ProducerParams{..} = do
 -- find the UTXO which corresponds to the PPKH of the wallet, then spend it, and create new datum with objection = True
 newtype ObjectionParams = ObjectionParams Campaign
     deriving stock (Generic)
-    deriving anyclass (FromJSON, ToJSON, ToSchema)
+    deriving anyclass (FromJSON, ToJSON)
 
 objects :: AsContractError e => ObjectionParams -> Contract w s e ()
 objects (ObjectionParams campaign@Campaign{..}) = do
@@ -418,6 +364,7 @@ objects (ObjectionParams campaign@Campaign{..}) = do
 
     let r = Redeemer $ PlutusTx.toBuiltinData Object
 
+        -- new datum with objection set to True
         obj_datum = AgapeDatum
                     { adContributor = ownppkh
                     , adObjects     = True
@@ -447,7 +394,7 @@ objects (ObjectionParams campaign@Campaign{..}) = do
 
 newtype PayoutParams = PayoutParams Campaign
     deriving stock (Generic)
-    deriving anyclass (FromJSON, ToJSON, ToSchema)
+    deriving anyclass (FromJSON, ToJSON)
 
 payout :: PayoutParams -> Contract w s Text ()
 payout (PayoutParams campaign@Campaign{..}) = do
@@ -498,7 +445,7 @@ evidenceFound utxos benfPPKH = any (\(_, _, AgapeDatum{..}) -> adContributor == 
 
 newtype RefundParams = RefundParams Campaign
     deriving stock (Generic)
-    deriving anyclass (FromJSON, ToJSON, ToSchema)
+    deriving anyclass (FromJSON, ToJSON)
 
 -- refund to the contributors
 -- > take into account objections, if objections are valid, then only proceed if signed by arbiter if not error.
@@ -550,7 +497,7 @@ objectionSuccessful utxos = fromValue objectionPower > (fromValue totalUTXOValue
 
 -- evidence
 -- > this is a producing transaction, so will be similar to contribute.
--- > if ownPPKH is the same as the Campaign's beneficiary, then only build the transaction, if not throw Error
+-- > only the Campaign beneficiary can provide evidence. If ownpppkh is not the beneficiary, throw an Error
 evidence :: ProducerParams -> Contract w s Text ()
 evidence ProducerParams{..} = do
     ownppkh <- ownPaymentPubKeyHash
@@ -677,6 +624,7 @@ trace1 = do
                          , ppEvidence            = Nothing
                          }
 
+    -- wallet 1 and wallet 2 contributes 10 Ada to the Campaign
     callEndpoint @"contribute" h1 producerParams
     callEndpoint @"contribute" h2 producerParams
 
@@ -727,6 +675,7 @@ trace2 = do
 
     void $ Trace.waitNSlots 25
 
+    -- Beneficiary triggers refunds after no evidence is provided
     callEndpoint @"refund" h3 refundParams
 
     s <- Trace.waitNSlots 1
@@ -793,6 +742,7 @@ trace3 = do
 
     void $ Trace.waitNSlots 25
 
+    -- wallet 3 (beneficiary) triggers payout after providing evidence
     callEndpoint @"payout" h3 payoutParams 
 
     s <- Trace.waitNSlots 1
@@ -859,11 +809,13 @@ trace4 = do
 
     void $ Trace.waitNSlots 15
 
+    -- wallet 1 and wallet 2 objects
     callEndpoint @"objects" h1 objectionParams
     callEndpoint @"objects" h2 objectionParams
 
     void $ Trace.waitNSlots 10
 
+    -- arbiter triggers refunds
     callEndpoint @"refund" h4 refundParams 
 
     s <- Trace.waitNSlots 1
@@ -931,11 +883,13 @@ trace5 = do
 
     void $ Trace.waitNSlots 15
 
+    -- wallet 1 and wallet 2 objects
     callEndpoint @"objects" h1 objectionParams
     callEndpoint @"objects" h2 objectionParams
 
     void $ Trace.waitNSlots 10
 
+    -- arbiter triggers payout
     callEndpoint @"payout" h4 payoutParams 
 
     s <- Trace.waitNSlots 1

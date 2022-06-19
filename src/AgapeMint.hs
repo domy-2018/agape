@@ -16,36 +16,10 @@
 module AgapeMint where
 
 import           Ledger
-import           Ledger.Ada           as Ada
-import qualified Ledger.Constraints   as Constraints
 import qualified Ledger.Typed.Scripts as Scripts
-import           Plutus.Contract
 import qualified PlutusTx
 import           PlutusTx.Prelude
 import           Ledger.Value         as Value
-
-import           Control.Monad        (void, when)
-import           Data.Aeson           (ToJSON, FromJSON)
-import           Data.Text            (Text)
-import           Data.List            (foldl')
-import           GHC.Generics         (Generic)
-import qualified Data.Map             as Map (singleton, fromList, toList)
-import qualified Prelude
-import           Prelude              (IO, String)
-import           Text.Printf          (printf)
-
-import           Playground.Contract  (KnownCurrency (..), ToSchema, ensureKnownCurrencies, mkSchemaDefinitions, printJson, printSchemas, stage)
-import qualified Plutus.Contract as Constraints
-import Plutus.Trace (runEmulatorTraceIO, activateContractWallet)
-
-
--- imports for EmulatorTrace testing
-import Plutus.V1.Ledger.Ada (lovelaceValueOf)
-import Wallet.Emulator.Wallet
-import Plutus.Trace (EmulatorTrace, activateContractWallet, callEndpoint, runEmulatorTraceIO)
-import qualified Plutus.Trace as Trace
-import Data.Text (Text)
-import qualified Control.Monad.Freer.Extras as Extras
 
 
 import AgapeData
@@ -55,8 +29,9 @@ import AgapeData
 -- > Ensure each token name minted can only be 1
 -- > Ensure only happens when payout is successful
 --   > past the objection deadline
---   > if objection successful, signed by Arbiter
---   > if objection not successful, evidence provided
+--   > if objection successful, signed by Arbiter (Note: unable to do this because I could not pass in script address as Redeemer parameter)
+--   > if objection not successful, evidence provided (Note: unable to do this because I could not pass in script address as Redeemer parameter)
+
 -- Note: I feel like there are other checks from the Agape script validator, which does not need to be replicated here
 -- because I feel like the mint policy script should only concern itself with when should the minting be allowed
 -- It shouldn't need to care whether the beneficiary is paid correctly, or if the contributors received the NFT
@@ -107,8 +82,7 @@ curSymbolAgape campaign = scriptCurrencySymbol $ policyAgape campaign
 
 
 
-
-{- Commenting out this entire section of code, because I tried to have a parameter to the redeemer action Payout Address, but 
+{- Commenting out this code, because I tried to have a parameter to the redeemer action Payout Address, but 
  - it doesn't seem to work with Minting policies. I got it to work when minting policies was not involved, but the moment I included
  - the minting policy into the transaction with a parameer to the Redeemer action, it fails with an error when validating the contract
 

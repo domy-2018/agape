@@ -16,27 +16,13 @@
 module AgapeData where
 
 import           Ledger
-import           Ledger.Ada           as Ada
-import qualified Ledger.Constraints   as Constraints
-import qualified Ledger.Typed.Scripts as Scripts
-import           Plutus.Contract
 import qualified PlutusTx
 import           PlutusTx.Prelude
-
-import           Control.Monad        (void, when)
 import           Data.Aeson           (ToJSON, FromJSON)
-import           Data.Text            (Text)
-import           Data.List            (foldl')
 import           GHC.Generics         (Generic)
-import qualified Data.Map             as Map (singleton, fromList, toList)
-import qualified Prelude
-import           Prelude              (IO, String)
-import           Text.Printf          (printf)
-
-import           Playground.Contract  (KnownCurrency (..), ToSchema, ensureKnownCurrencies, mkSchemaDefinitions, printJson, printSchemas, stage)
 
 -- Parameters
--- > Campaign (description, deadline_campaign, deadline_objection, beneficiary, arbiter)
+-- > Campaign (name, description, deadline_campaign, deadline_objection, beneficiary, arbiter)
 --
 -- Datum
 -- > contributor PPKH
@@ -56,7 +42,7 @@ data Campaign = Campaign
     , cBeneficiary    :: !PaymentPubKeyHash
     , cArbiter        :: !PaymentPubKeyHash
     }
-    deriving (Generic, ToJSON, FromJSON, ToSchema)
+    deriving (Generic, ToJSON, FromJSON)
 
 PlutusTx.makeLift ''Campaign
 
@@ -68,10 +54,12 @@ data AgapeDatum = AgapeDatum
 
 PlutusTx.unstableMakeIsData ''AgapeDatum
 
+-- note for AgapeAction, I tried to include Payout with the script address
+-- so that I can pass it to the Minting policy to search for UTXOs related to the
+-- script address, but I kept getting an error for that.
 data AgapeAction = Payout | Refund | Object
 
 PlutusTx.unstableMakeIsData ''AgapeAction
-
 
 
 
