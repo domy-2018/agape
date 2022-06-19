@@ -28,6 +28,18 @@ Disputes occur if any of the participants are not satisfied with the outcome. A 
 ![Successful objection](./img/successfulobject.png)
 
 
+## Testing
+
+5 emulator trace tests have been included. To run the emulator trace tests, run in cabal repl, then run the following commands:
+
+1. test1 - wallet 1 and wallet 2 contributes to a campaign
+2. test2 - wallet 1 and wallet 2 contributes to a campaign. No evidence provided, and wallet 3 triggers a refund.
+3. test3 - wallet 1 and wallet 2 contributes to a campaign. Beneficiary (wallet 3) provides evidence, and triggers a payout.
+4. test4 - wallet 1 and wallet 2 contributes to a campaign. Beneficiary (wallet 3) provides evidence. Wallet 1 and 2 objects. Arbiter triggers a refund.
+5. test5 - wallet 1 and wallet 2 contributes to a campaign. Beneficiary (wallet 3) provides evidence. Wallet 1 and 2 objects. Arbiter triggers a payout.
+
+
+
 ## Current limitations, improvements and issues
 
 ### Improvements
