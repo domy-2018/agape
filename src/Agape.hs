@@ -32,6 +32,7 @@ import           GHC.Generics         (Generic)
 import qualified Data.Map             as Map (singleton, fromList, toList)
 import qualified Prelude
 import           Prelude              (IO, String)
+import           Data.String
 import           Text.Printf          (printf)
 
 import           Playground.Contract  (KnownCurrency (..), ToSchema, ensureKnownCurrencies, mkSchemaDefinitions, printJson, printSchemas, stage)
@@ -50,8 +51,6 @@ import qualified Control.Monad.Freer.Extras as Extras
 
 import AgapeData
 import AgapeMint
-import AgapeMint (policyAgape, curSymbolAgape)
-import qualified Ledger.Value as Value
 
 
 -- Improvements -> If Arbiter needs to act, then arbiter gets a portion of the funds as compensation
@@ -107,8 +106,13 @@ PlutusTx.unstableMakeIsData ''AgapeAction
 --       this is to ensure that for every contributor, there is only one Datum. It gets complicated for refund purposes
 --       if there are multiple UTXOs with the same contributor PPKH
 {-# INLINABLE mkValidatorAgape #-}
-mkValidatorAgape :: Campaign -> AgapeDatum -> AgapeAction -> ScriptContext -> Bool
-mkValidatorAgape Campaign{..} agapeDatum redeemerAction ctx =
+mkValidatorAgape :: CurrencySymbol -> Campaign -> AgapeDatum -> AgapeAction -> ScriptContext -> Bool
+mkValidatorAgape cs Campaign{..} agapeDatum redeemerAction ctx =
+
+    -- all the script UTXOs to the transaction must contain the valid datum, if not fail.
+    -- Not sure if required, but I feel this will prevent someone trying to spend an invalid datum
+    traceIfFalse "Some input UTXO has an invalid datum" (length ownInputsValidDatum == length ownInputs) &&
+
     case redeemerAction of
         -- objection validation rules:
         -- > after deadline and before objection deadline
@@ -141,12 +145,17 @@ mkValidatorAgape Campaign{..} agapeDatum redeemerAction ctx =
         --                                                 after objection deadline to payout? There's nothing stopping the beneficiary from
         --                                                 putting some fake evidence after the objection deadline.
         --                                                 Solution: add a refund window? so gives some time to refund first if no evidence.
+        -- > Each contributor gets one NFT
+        -- > Check total minted NFT matches number of unique contributors
         Payout -> traceIfFalse "payout - have not passed objection deadline" correctPastObjectionDeadline &&
                   traceIfFalse "payout - amount paid to beneficiary incorrect" beneficiaryPaidCorrectly   &&
+                  traceIfFalse "payout - total minted NFT matches contributor count" correctNFTMinted     &&
+                  traceIfFalse "payout - every contributor must receive the NFT" correctContributorNFT    &&
                   if objectionIsSuccessful
                   then traceIfFalse "payout - not signed by arbiter" signedByArbiter
                   else traceIfFalse "payout - evidence not provided" evidenceProvided                     &&
                        traceIfFalse "payout - not signed by beneficiary" payoutSignedByBeneficiary
+
   where
     info :: TxInfo
     info = scriptContextTxInfo ctx
@@ -271,6 +280,28 @@ mkValidatorAgape Campaign{..} agapeDatum redeemerAction ctx =
     beneficiaryPaidCorrectly :: Bool
     beneficiaryPaidCorrectly = any (== totalInputValue) [txOutValue o | o <- txInfoOutputs info, txOutAddress o == pubKeyHashAddress cBeneficiary Nothing] -- stake key?
 
+    ownInputsContributorsPPKH :: [PaymentPubKeyHash]
+    ownInputsContributorsPPKH = nub [adContributor agd | (_, agd) <- ownInputsValidDatum, adContributor agd /= cBeneficiary]
+
+    -- number of NFT minted is 1 and must match the currencySymbol of the correct NFT
+    nftMintList :: [(CurrencySymbol, TokenName, Integer)]
+    nftMintList = [(nftcs, nfttn, nftnum) | (nftcs, nfttn, nftnum) <- flattenValue (txInfoMint info), nftnum == 1 && nftcs == cs]
+
+    -- check that the number of unique contributor PPKH equals the number of NFT minted
+    correctNFTMinted :: Bool
+    correctNFTMinted = length nftMintList == length ownInputsContributorsPPKH
+
+    -- check that each Contributor received an NFT
+    correctContributorNFT :: Bool
+    correctContributorNFT = checkContributorNFT ownInputsContributorsPPKH (txInfoOutputs info)
+
+    -- loop through each contributor PPKH, and look for the corresponding txout
+    -- check that each one received one NFT
+    checkContributorNFT :: [PaymentPubKeyHash] -> [TxOut] -> Bool
+    checkContributorNFT [] _        = True
+    checkContributorNFT (p:ps) txos = case [txOutValue txo | txo <- txos, txOutAddress txo == pubKeyHashAddress p Nothing] of
+                                          [nval] -> length [ () | (nvalcs, _, nvalnum) <- flattenValue nval, nvalcs == cs && nvalnum == 1] == 1 && checkContributorNFT ps txos
+                                          _      -> traceError "contributor TxOut not found"
 
 data AgapeType
 instance Scripts.ValidatorTypes AgapeType where
@@ -278,23 +309,24 @@ instance Scripts.ValidatorTypes AgapeType where
     type DatumType    AgapeType = AgapeDatum
 
 
-agapeTypedValidator :: Campaign -> Scripts.TypedValidator AgapeType
-agapeTypedValidator c = Scripts.mkTypedValidator @AgapeType
+agapeTypedValidator :: CurrencySymbol -> Campaign -> Scripts.TypedValidator AgapeType
+agapeTypedValidator cs c = Scripts.mkTypedValidator @AgapeType
     ($$(PlutusTx.compile [|| mkValidatorAgape ||])
+    `PlutusTx.applyCode` PlutusTx.liftCode cs 
     `PlutusTx.applyCode` PlutusTx.liftCode c)
     $$(PlutusTx.compile [|| wrap ||])
   where
     wrap = Scripts.wrapValidator @AgapeDatum @AgapeAction
 
 
-agapeValidator :: Campaign -> Validator
-agapeValidator = Scripts.validatorScript . agapeTypedValidator
+agapeValidator :: CurrencySymbol -> Campaign -> Validator
+agapeValidator cs = Scripts.validatorScript . agapeTypedValidator cs
 
-agapeValHash :: Campaign -> Ledger.ValidatorHash
-agapeValHash = Scripts.validatorHash . agapeTypedValidator
+agapeValHash :: CurrencySymbol -> Campaign -> Ledger.ValidatorHash
+agapeValHash cs = Scripts.validatorHash . agapeTypedValidator cs
 
-agapeAddress :: Campaign -> Ledger.Address
-agapeAddress = scriptAddress . agapeValidator
+agapeAddress :: CurrencySymbol -> Campaign -> Ledger.Address
+agapeAddress cs = scriptAddress . agapeValidator cs
 
 
 
@@ -330,7 +362,8 @@ policyAgape campaign = mkMintingPolicyScript $
 -- > evidence
 
 data ProducerParams = ProducerParams
-    { ppCampaignDescription :: !BuiltinByteString
+    { ppCampaignName        :: !BuiltinByteString
+    , ppCampaignDescription :: !BuiltinByteString
     , ppCampaignDeadline    :: !POSIXTime
     , ppCampaignDeadlineObj :: !POSIXTime
     , ppCampaignBeneficiary :: !PaymentPubKeyHash
@@ -346,7 +379,8 @@ contribute :: AsContractError e => ProducerParams -> Contract w s e ()
 contribute ProducerParams{..} = do
     ownppkh <- ownPaymentPubKeyHash
     let campaign = Campaign
-                   { cDescription    = ppCampaignDescription
+                   { cName           = ppCampaignName
+                   , cDescription    = ppCampaignDescription
                    , cDeadline       = ppCampaignDeadline
                    , cDeadlineObject = ppCampaignDeadlineObj
                    , cBeneficiary    = ppCampaignBeneficiary
@@ -360,10 +394,12 @@ contribute ProducerParams{..} = do
               }
 
         val = lovelaceValueOf ppContributeAmt
+        
+        cs = curSymbolAgape campaign
 
         tx = Constraints.mustPayToTheScript dat val
         
-    ledgerTx <- submitTxConstraints (agapeTypedValidator campaign) tx
+    ledgerTx <- submitTxConstraints (agapeTypedValidator cs campaign) tx
     void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
     logInfo @String $ printf "contributed to campaign"
 
@@ -377,7 +413,8 @@ newtype ObjectionParams = ObjectionParams Campaign
 objects :: AsContractError e => ObjectionParams -> Contract w s e ()
 objects (ObjectionParams campaign@Campaign{..}) = do
     ownppkh <- ownPaymentPubKeyHash
-    utxos <- findUTXOs campaign (Just ownppkh)
+    let cs = curSymbolAgape campaign
+    utxos <- findUTXOs cs campaign (Just ownppkh)
 
     let r = Redeemer $ PlutusTx.toBuiltinData Object
 
@@ -389,8 +426,8 @@ objects (ObjectionParams campaign@Campaign{..}) = do
         
         totalval = mconcat [_ciTxOutValue chainidx | (_, chainidx, _) <- utxos]
 
-        lookups = Constraints.typedValidatorLookups (agapeTypedValidator campaign)              Prelude.<>
-                  Constraints.otherScript (agapeValidator campaign)                             Prelude.<>
+        lookups = Constraints.typedValidatorLookups (agapeTypedValidator cs campaign)           Prelude.<>
+                  Constraints.otherScript (agapeValidator cs campaign)                          Prelude.<>
                   Constraints.unspentOutputs (Map.fromList [(oref, o) | (oref, o, _) <- utxos])
 
         tx = Constraints.mustValidateIn (interval cDeadline cDeadlineObject)                <>
@@ -406,7 +443,7 @@ objects (ObjectionParams campaign@Campaign{..}) = do
 -- > must be past the objection deadline
 -- > must not have a successful objection
 -- > if objection is successful, then only proceed if signed by arbiter
--- > Also need to mint NFT for every contributer (**TODO**)
+-- > Also need to mint NFT for every contributer
 
 newtype PayoutParams = PayoutParams Campaign
     deriving stock (Generic)
@@ -414,7 +451,8 @@ newtype PayoutParams = PayoutParams Campaign
 
 payout :: PayoutParams -> Contract w s Text ()
 payout (PayoutParams campaign@Campaign{..}) = do
-    utxos   <- findUTXOs campaign Nothing -- find all suitable utxos
+    let cs = curSymbolAgape campaign
+    utxos   <- findUTXOs cs campaign Nothing -- find all suitable utxos
     now     <- currentTime
     ownppkh <- ownPaymentPubKeyHash
 
@@ -424,23 +462,30 @@ payout (PayoutParams campaign@Campaign{..}) = do
     then when (ownppkh /= cArbiter)                    $ throwError "You must be an arbiter to process the payout as objections are successful"
     else when (not $ evidenceFound utxos cBeneficiary) $ throwError "Evidence not found, cannot payout"
 
+    logInfo @String $ printf "address is: %s" (Prelude.show $ agapeAddress (curSymbolAgape campaign) campaign) 
+
     let r = Redeemer $ PlutusTx.toBuiltinData Payout
 
         totalval = mconcat [_ciTxOutValue chainidx | (_, chainidx, _) <- utxos]
 
-        nftval = Value.singleton (curSymbolAgape campaign) "TokenName" 1
+        nonBenifPPKH = nub [adContributor agd | (_, _, agd) <- utxos, adContributor agd /= cBeneficiary] -- list of unique PPKH which is not beneficiary
 
-        lookups = Constraints.typedValidatorLookups (agapeTypedValidator campaign)              Prelude.<>
-                  Constraints.otherScript (agapeValidator campaign)                             Prelude.<>
+        -- generate the list of Value for each unique contributor PPKH, NFT TokenName = campaign name ++ "#" ++ number
+        nftvals = take (length nonBenifPPKH) [Value.singleton (curSymbolAgape campaign) (TokenName $ appendByteString cName (fromString $ "#" ++ Prelude.show tokenid)) 1 | tokenid <- [1..]]
+
+        lookups = Constraints.typedValidatorLookups (agapeTypedValidator cs campaign)           Prelude.<>
+                  Constraints.otherScript (agapeValidator cs campaign)                          Prelude.<>
                   Constraints.unspentOutputs (Map.fromList [(oref, o) | (oref, o, _) <- utxos]) Prelude.<>
                   Constraints.mintingPolicy (policyAgape campaign)
 
         tx = Constraints.mustValidateIn (from cDeadlineObject)                          <>
              Constraints.mustPayToPubKey cBeneficiary totalval                          <>
              mconcat [Constraints.mustSpendScriptOutput oref r | (oref, _, _) <- utxos] <>
-             Constraints.mustMintValue nftval  <>
-             Constraints.mustPayToPubKey ownppkh (nftval <> lovelaceValueOf 2_000_000)
+             Constraints.mustMintValue (mconcat nftvals)                                <> -- mint all the NFTs
+             -- pay to each of the contributor's ppkh note: needs to include the minimal ada
+             mconcat [Constraints.mustPayToPubKey paytoppkh (onenft <> lovelaceValueOf 2_000_000) | (paytoppkh, onenft) <- zip nonBenifPPKH nftvals]
 
+             
     ledgerTx <- submitTxConstraintsWith lookups tx
     void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
     logInfo @String $ printf "paid out"
@@ -462,7 +507,8 @@ refund :: RefundParams -> Contract w s Text ()
 refund (RefundParams campaign@Campaign{..}) = do
     -- get the utxos, filter for the right Datum to get the Contributor, get the Value.
     -- then for each contributor ppkh, create a Constraint and put the value in as payment 
-    utxos   <- findUTXOs campaign Nothing
+    let cs = curSymbolAgape campaign
+    utxos   <- findUTXOs cs campaign Nothing
     now     <- currentTime
     ownppkh <- ownPaymentPubKeyHash
 
@@ -473,9 +519,9 @@ refund (RefundParams campaign@Campaign{..}) = do
     else when (evidenceFound utxos cBeneficiary) $ throwError "Evidence was found, cannot refund"
 
     let r = Redeemer $ PlutusTx.toBuiltinData Refund
-   
-        lookups = Constraints.typedValidatorLookups (agapeTypedValidator campaign)              Prelude.<>
-                  Constraints.otherScript (agapeValidator campaign)                             Prelude.<>
+
+        lookups = Constraints.typedValidatorLookups (agapeTypedValidator cs campaign)           Prelude.<>
+                  Constraints.otherScript (agapeValidator cs campaign)                          Prelude.<>
                   Constraints.unspentOutputs (Map.fromList [(oref, o) | (oref, o, _) <- utxos])
 
         tx = Constraints.mustValidateIn (from cDeadlineObject) <>
@@ -513,7 +559,8 @@ evidence ProducerParams{..} = do
     when (isNothing ppEvidence)             $ throwError "no evidence provided"
 
     let campaign = Campaign
-                   { cDescription    = ppCampaignDescription
+                   { cName           = ppCampaignName
+                   , cDescription    = ppCampaignDescription
                    , cDeadline       = ppCampaignDeadline
                    , cDeadlineObject = ppCampaignDeadlineObj
                    , cBeneficiary    = ppCampaignBeneficiary
@@ -528,9 +575,11 @@ evidence ProducerParams{..} = do
 
         val = lovelaceValueOf ppContributeAmt
 
+        cs = curSymbolAgape campaign
+
         tx = Constraints.mustPayToTheScript dat val
 
-    ledgerTx <- submitTxConstraints (agapeTypedValidator campaign) tx
+    ledgerTx <- submitTxConstraints (agapeTypedValidator cs campaign) tx
     void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
     logInfo @String $ printf "beneficiary submitted evidence"
 
@@ -541,9 +590,9 @@ evidence ProducerParams{..} = do
 -- find valid UTXOs with valid datums at the script address. If provided with PPKH, will find UTXOs with that PPKH
 -- a valid UTXO is one which:
 -- > contains the AgapeDatum data object
-findUTXOs :: AsContractError e => Campaign -> Maybe PaymentPubKeyHash -> Contract w s e [(TxOutRef, ChainIndexTxOut, AgapeDatum)]
-findUTXOs c mppkh = do
-    utxos <- utxosAt $ agapeAddress c
+findUTXOs :: AsContractError e => CurrencySymbol -> Campaign -> Maybe PaymentPubKeyHash -> Contract w s e [(TxOutRef, ChainIndexTxOut, AgapeDatum)]
+findUTXOs cs c mppkh = do
+    utxos <- utxosAt $ agapeAddress cs c
     
     let xs = Map.toList utxos
 
@@ -595,6 +644,14 @@ test2 = runEmulatorTraceIO trace2
 test3 :: IO()
 test3 = runEmulatorTraceIO trace3
 
+-- refund after objection succesesful
+test4 :: IO()
+test4 = runEmulatorTraceIO trace4
+
+-- payout after objection successful
+test5 :: IO()
+test5 = runEmulatorTraceIO trace5
+
 
 trace1 :: EmulatorTrace ()
 trace1 = do
@@ -602,6 +659,7 @@ trace1 = do
     h2 <- activateContractWallet (knownWallet 2) endpoints
 
     let 
+        campaignName   = "CharityRun"
         campaignDesc   = "run a marathon for charity"
         campaignDeadl  = 1596059101000 -- slot 10
         campaignDeadlO = 1596059111000 -- slot 20
@@ -609,7 +667,8 @@ trace1 = do
         arbiter        = mockWalletPaymentPubKeyHash (knownWallet 4) -- arbiter
 
         producerParams = ProducerParams
-                         { ppCampaignDescription = campaignDesc
+                         { ppCampaignName        = campaignName
+                         , ppCampaignDescription = campaignDesc
                          , ppCampaignDeadline    = campaignDeadl
                          , ppCampaignDeadlineObj = campaignDeadlO
                          , ppCampaignBeneficiary = beneficiary
@@ -634,6 +693,7 @@ trace2 = do
     h3 <- activateContractWallet (knownWallet 3) endpoints
 
     let 
+        campaignName   = "CharityRun"
         campaignDesc   = "run a marathon for charity"
         campaignDeadl  = 1596059101000 -- slot 10
         campaignDeadlO = 1596059111000 -- slot 20
@@ -641,7 +701,8 @@ trace2 = do
         arbiter        = mockWalletPaymentPubKeyHash (knownWallet 4) -- arbiter
 
         producerParams = ProducerParams
-                         { ppCampaignDescription = campaignDesc
+                         { ppCampaignName        = campaignName
+                         , ppCampaignDescription = campaignDesc
                          , ppCampaignDeadline    = campaignDeadl
                          , ppCampaignDeadlineObj = campaignDeadlO
                          , ppCampaignBeneficiary = beneficiary
@@ -651,7 +712,8 @@ trace2 = do
                          }
 
         campaign = Campaign
-            { cDescription    = campaignDesc
+            { cName           = campaignName
+            , cDescription    = campaignDesc
             , cDeadline       = campaignDeadl
             , cDeadlineObject = campaignDeadlO
             , cBeneficiary    = beneficiary
@@ -681,6 +743,7 @@ trace3 = do
     h4 <- activateContractWallet (knownWallet 4) endpoints
 
     let 
+        campaignName   = "CharityRun"
         campaignDesc   = "run a marathon for charity"
         campaignDeadl  = 1596059101000 -- slot 10
         campaignDeadlO = 1596059111000 -- slot 20
@@ -689,7 +752,8 @@ trace3 = do
         evid           = "http://my_marathon_results.com"
 
         contributorParams = ProducerParams
-            { ppCampaignDescription = campaignDesc
+            { ppCampaignName        = campaignName
+            , ppCampaignDescription = campaignDesc
             , ppCampaignDeadline    = campaignDeadl
             , ppCampaignDeadlineObj = campaignDeadlO
             , ppCampaignBeneficiary = beneficiary
@@ -699,7 +763,8 @@ trace3 = do
             }
 
         evidenceParams = ProducerParams
-            { ppCampaignDescription = campaignDesc
+            { ppCampaignName        = campaignName
+            , ppCampaignDescription = campaignDesc
             , ppCampaignDeadline    = campaignDeadl
             , ppCampaignDeadlineObj = campaignDeadlO
             , ppCampaignBeneficiary = beneficiary
@@ -709,7 +774,8 @@ trace3 = do
             }
         
         campaign = Campaign
-            { cDescription    = campaignDesc
+            { cName           = campaignName
+            , cDescription    = campaignDesc
             , cDeadline       = campaignDeadl
             , cDeadlineObject = campaignDeadlO
             , cBeneficiary    = beneficiary
@@ -728,6 +794,149 @@ trace3 = do
     void $ Trace.waitNSlots 25
 
     callEndpoint @"payout" h3 payoutParams 
+
+    s <- Trace.waitNSlots 1
+
+    Extras.logInfo $ "Reached " ++ Prelude.show s
+
+trace4 :: EmulatorTrace ()
+trace4 = do
+    h1 <- activateContractWallet (knownWallet 1) endpoints
+    h2 <- activateContractWallet (knownWallet 2) endpoints
+    h3 <- activateContractWallet (knownWallet 3) endpoints
+    h4 <- activateContractWallet (knownWallet 4) endpoints
+
+    let 
+        campaignName   = "CharityRun"
+        campaignDesc   = "run a marathon for charity"
+        campaignDeadl  = 1596059101000 -- slot 10
+        campaignDeadlO = 1596059111000 -- slot 20
+        beneficiary    = mockWalletPaymentPubKeyHash (knownWallet 3) -- beneficiary
+        arbiter        = mockWalletPaymentPubKeyHash (knownWallet 4) -- arbiter
+        evid           = "http://my_marathon_results.com"
+
+        contributorParams = ProducerParams
+            { ppCampaignName        = campaignName
+            , ppCampaignDescription = campaignDesc
+            , ppCampaignDeadline    = campaignDeadl
+            , ppCampaignDeadlineObj = campaignDeadlO
+            , ppCampaignBeneficiary = beneficiary
+            , ppCampaignArbiter     = arbiter
+            , ppContributeAmt       = 10_000_000
+            , ppEvidence            = Nothing
+            }
+
+        evidenceParams = ProducerParams
+            { ppCampaignName        = campaignName
+            , ppCampaignDescription = campaignDesc
+            , ppCampaignDeadline    = campaignDeadl
+            , ppCampaignDeadlineObj = campaignDeadlO
+            , ppCampaignBeneficiary = beneficiary
+            , ppCampaignArbiter     = arbiter
+            , ppContributeAmt       = 2_000_000
+            , ppEvidence            = Just evid
+            }
+        
+        campaign = Campaign
+            { cName           = campaignName
+            , cDescription    = campaignDesc
+            , cDeadline       = campaignDeadl
+            , cDeadlineObject = campaignDeadlO
+            , cBeneficiary    = beneficiary
+            , cArbiter        = arbiter
+            }
+
+        refundParams = RefundParams campaign
+
+        objectionParams = ObjectionParams campaign
+
+    callEndpoint @"contribute" h1 contributorParams
+    callEndpoint @"contribute" h2 contributorParams
+
+    void $ Trace.waitNSlots 1
+
+    callEndpoint @"evidence" h3 evidenceParams
+
+    void $ Trace.waitNSlots 15
+
+    callEndpoint @"objects" h1 objectionParams
+    callEndpoint @"objects" h2 objectionParams
+
+    void $ Trace.waitNSlots 10
+
+    callEndpoint @"refund" h4 refundParams 
+
+    s <- Trace.waitNSlots 1
+
+    Extras.logInfo $ "Reached " ++ Prelude.show s
+
+
+trace5 :: EmulatorTrace ()
+trace5 = do
+    h1 <- activateContractWallet (knownWallet 1) endpoints
+    h2 <- activateContractWallet (knownWallet 2) endpoints
+    h3 <- activateContractWallet (knownWallet 3) endpoints
+    h4 <- activateContractWallet (knownWallet 4) endpoints
+
+    let 
+        campaignName   = "CharityRun"
+        campaignDesc   = "run a marathon for charity"
+        campaignDeadl  = 1596059101000 -- slot 10
+        campaignDeadlO = 1596059111000 -- slot 20
+        beneficiary    = mockWalletPaymentPubKeyHash (knownWallet 3) -- beneficiary
+        arbiter        = mockWalletPaymentPubKeyHash (knownWallet 4) -- arbiter
+        evid           = "http://my_marathon_results.com"
+
+        contributorParams = ProducerParams
+            { ppCampaignName        = campaignName
+            , ppCampaignDescription = campaignDesc
+            , ppCampaignDeadline    = campaignDeadl
+            , ppCampaignDeadlineObj = campaignDeadlO
+            , ppCampaignBeneficiary = beneficiary
+            , ppCampaignArbiter     = arbiter
+            , ppContributeAmt       = 10_000_000
+            , ppEvidence            = Nothing
+            }
+
+        evidenceParams = ProducerParams
+            { ppCampaignName        = campaignName
+            , ppCampaignDescription = campaignDesc
+            , ppCampaignDeadline    = campaignDeadl
+            , ppCampaignDeadlineObj = campaignDeadlO
+            , ppCampaignBeneficiary = beneficiary
+            , ppCampaignArbiter     = arbiter
+            , ppContributeAmt       = 2_000_000
+            , ppEvidence            = Just evid
+            }
+        
+        campaign = Campaign
+            { cName           = campaignName
+            , cDescription    = campaignDesc
+            , cDeadline       = campaignDeadl
+            , cDeadlineObject = campaignDeadlO
+            , cBeneficiary    = beneficiary
+            , cArbiter        = arbiter
+            }
+
+        payoutParams = PayoutParams campaign
+
+        objectionParams = ObjectionParams campaign
+
+    callEndpoint @"contribute" h1 contributorParams
+    callEndpoint @"contribute" h2 contributorParams
+
+    void $ Trace.waitNSlots 1
+
+    callEndpoint @"evidence" h3 evidenceParams
+
+    void $ Trace.waitNSlots 15
+
+    callEndpoint @"objects" h1 objectionParams
+    callEndpoint @"objects" h2 objectionParams
+
+    void $ Trace.waitNSlots 10
+
+    callEndpoint @"payout" h4 payoutParams 
 
     s <- Trace.waitNSlots 1
 

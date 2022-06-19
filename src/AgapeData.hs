@@ -49,7 +49,8 @@ import           Playground.Contract  (KnownCurrency (..), ToSchema, ensureKnown
 -- > Refund
 
 data Campaign = Campaign
-    { cDescription    :: !BuiltinByteString
+    { cName           :: !BuiltinByteString
+    , cDescription    :: !BuiltinByteString
     , cDeadline       :: !POSIXTime
     , cDeadlineObject :: !POSIXTime
     , cBeneficiary    :: !PaymentPubKeyHash
@@ -70,4 +71,7 @@ PlutusTx.unstableMakeIsData ''AgapeDatum
 data AgapeAction = Payout | Refund | Object
 
 PlutusTx.unstableMakeIsData ''AgapeAction
+
+
+
 
